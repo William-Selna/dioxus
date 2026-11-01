@@ -400,22 +400,28 @@ impl<A, M, F: HotFunction<A, M>> HotFn<A, M, F> {
     /// Note that Subsecond does not track this state over time, so it's up to the runtime integration
     /// to track this state and diff it.
     pub fn ptr_address(&self) -> HotFnPtr {
-        // Same rule as `try_call`: only a fn pointer the jump table knows is addressed by its
-        // own bits. A pointer-sized closure's bits are captured data; it is addressed by its
-        // `call_it`, which is also the pointer `try_call_with_ptr` expects back.
-        if size_of::<F>() == size_of::<fn() -> ()>() && self.bits_are_a_patched_fn() {
+        let known_fn_ptr = <F as HotFunction<A, M>>::call_it as *const () as usize;
+        let patched_call_it = unsafe { get_jump_table() }
+            .and_then(|jump_table| jump_table.map.get(&(known_fn_ptr as u64)).cloned());
+
+        if size_of::<F>() == size_of::<fn() -> ()>() {
+            // A fn pointer is addressed by its own bits, patched or not, so two fn pointers of
+            // one type keep distinct addresses (`call_it` is one wrapper per type). A closure
+            // that captures one pointer-sized value is the same size; its bits are captured
+            // data, and they stay its address too, unless its body was patched: then it is
+            // addressed by its patched `call_it`, the pointer `try_call_with_ptr` jumps to.
+            // The two cannot be told apart at the type level; a patched fn pointer's bits are
+            // a key of the jump table, a closure's never are.
+            if !self.bits_are_a_patched_fn()
+                && let Some(ptr) = patched_call_it
+            {
+                return HotFnPtr(ptr);
+            }
             let ptr: usize = unsafe { std::mem::transmute_copy(&self.inner) };
             return HotFnPtr(ptr as u64);
         }
 
-        let known_fn_ptr = <F as HotFunction<A, M>>::call_it as *const () as usize;
-        if let Some(jump_table) = unsafe { get_jump_table() }
-            && let Some(ptr) = jump_table.map.get(&(known_fn_ptr as u64)).cloned()
-        {
-            return HotFnPtr(ptr);
-        }
-
-        HotFnPtr(known_fn_ptr as u64)
+        HotFnPtr(patched_call_it.unwrap_or(known_fn_ptr as u64))
     }
 
     /// Attempt to call the function with the given arguments.
@@ -483,8 +489,16 @@ impl<A, M, F: HotFunction<A, M>> HotFn<A, M, F> {
             // Try to handle known function pointers. This is *really really* unsafe, but due to how
             // rust trait objects work, it's impossible to make an arbitrary usize-sized type implement Fn()
             // since that would require a vtable pointer, pushing out the bounds of the pointer size.
-            if size_of::<F>() == size_of::<fn() -> ()>() && self.bits_are_a_patched_fn() {
-                return Ok(self.inner.call_as_ptr(args));
+            //
+            // `ptr_address` hands out the callable's own bits for a fn pointer and for a
+            // pointer-sized closure whose body is not patched; `call_as_ptr` dispatches both (the
+            // jump table for a patched fn pointer, the original body otherwise). Any other pointer
+            // is a patched `call_it`, jumped to below.
+            if size_of::<F>() == size_of::<fn() -> ()>() {
+                let bits: usize = std::mem::transmute_copy(&self.inner);
+                if ptr.0 == bits as u64 || self.bits_are_a_patched_fn() {
+                    return Ok(self.inner.call_as_ptr(args));
+                }
             }
 
             // Handle trait objects. This will occur for sizes other than usize. Normal rust functions
@@ -1031,5 +1045,55 @@ mod tests {
             Some(99),
             "try_call_with_ptr runs the patched body"
         );
+    }
+
+    fn one() -> i32 {
+        1
+    }
+
+    fn two() -> i32 {
+        2
+    }
+
+    /// Without a patch, a fn pointer is addressed by its own bits, so two fn pointers of one
+    /// type stay distinct (the type's `call_it` is one wrapper for both), and the address
+    /// calls the pointer it came from. The same holds for an unpatched pointer-sized closure.
+    #[test]
+    fn unpatched_fn_pointers_of_one_type_keep_distinct_addresses() {
+        let first: fn() -> i32 = one;
+        let second: fn() -> i32 = two;
+        let mut hot_first = HotFn::current(first);
+        let mut hot_second = HotFn::current(second);
+
+        let first_ptr = hot_first.ptr_address();
+        let second_ptr = hot_second.ptr_address();
+        assert_eq!(first_ptr.0, first as usize as u64, "its own bits");
+        assert_eq!(second_ptr.0, second as usize as u64, "its own bits");
+        assert_ne!(
+            first_ptr.0, second_ptr.0,
+            "distinct fn pointers, distinct addresses"
+        );
+
+        assert_eq!(hot_first.call(()), 1);
+        assert_eq!(hot_second.call(()), 2);
+        assert_eq!(
+            unsafe { hot_first.try_call_with_ptr(first_ptr, ()) }.ok(),
+            Some(1)
+        );
+        assert_eq!(
+            unsafe { hot_second.try_call_with_ptr(second_ptr, ()) }.ok(),
+            Some(2)
+        );
+
+        let x = 41_i32;
+        let closure = || x + 1;
+        assert_eq!(size_of_val(&closure), size_of::<fn()>());
+        let mut hot = HotFn::current(closure);
+        let ptr = hot.ptr_address();
+        assert_eq!(
+            ptr.0, &x as *const i32 as u64,
+            "an unpatched closure: its bits"
+        );
+        assert_eq!(unsafe { hot.try_call_with_ptr(ptr, ()) }.ok(), Some(42));
     }
 }
